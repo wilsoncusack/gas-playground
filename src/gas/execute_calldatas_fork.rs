@@ -1,14 +1,20 @@
+use alloy_sol_types::sol;
+use alloy_sol_types::SolCall;
 use dotenv::dotenv;
+use forge::constants::CHEATCODE_ADDRESS;
 use std::env;
 
 use alloy::providers::{Provider, ProviderBuilder};
 use alloy_eips::BlockId;
 use alloy_primitives::{Address, Bytes, Log, U256};
 use alloy_rpc_types_eth::BlockTransactionsKind;
-use forge::{backend, executors::ExecutorBuilder, opts::EvmOpts, traces::CallTraceArena};
+use forge::{
+    backend, executors::ExecutorBuilder, inspectors::CheatsConfig, opts::EvmOpts,
+    traces::CallTraceArena,
+};
 use foundry_config::Config;
 use revm::{interpreter::InstructionResult, primitives::TxEnv};
-use revm_primitives::{BlockEnv, CfgEnv, Env};
+use revm_primitives::{address, BlockEnv, CfgEnv, Env};
 use serde::{Deserialize, Serialize};
 
 #[derive(Deserialize, Clone)]
@@ -75,14 +81,37 @@ pub async fn execute_calldatas_fork(
     };
     let backend = backend::Backend::spawn(opts.get_fork(&Config::default(), opts.evm_env().await?));
     let mut executor = ExecutorBuilder::new()
-        .inspectors(|stack| stack.trace(true).logs(true))
+        .inspectors(|stack| {
+            stack
+                .trace(true)
+                .logs(true)
+                .cheatcodes(CheatsConfig::default().into())
+        })
         .build(env, backend);
-    let res = executor.deploy(Address::ZERO, bytecode, U256::ZERO, None)?;
+    // let res = executor.deploy(Address::ZERO, bytecode, U256::ZERO, None)?;
 
+    ///
+    sol! {
+        function etch(address target, bytes calldata newRuntimeBytecode) external;
+    }
+    let deploy_address = address!("1000000000000000000000000000000000000000");
+    let calldata = etchCall {
+        target: deploy_address,
+        newRuntimeBytecode: bytecode,
+    }
+    .abi_encode();
+    let call = Call {
+        caller: Address::ZERO,
+        calldata: calldata.into(),
+        value: U256::ZERO,
+    };
+    executor.transact_raw(call.caller, CHEATCODE_ADDRESS, call.calldata, call.value)?;
+    ///
     calls
         .into_iter()
         .map(|call| {
-            let r = executor.transact_raw(call.caller, res.address, call.calldata, call.value)?;
+            let r =
+                executor.transact_raw(call.caller, deploy_address, call.calldata, call.value)?;
             Ok(ExecutionResult {
                 exit_reason: r.exit_reason,
                 reverted: r.reverted,
@@ -108,8 +137,9 @@ mod test {
     async fn test_execute() {
         let solidity_code = r#"
             pragma solidity ^0.8.0;
+
             contract Test {
-                function test(uint256 tokenId) external view returns (bytes memory) {
+                function test(uint256 tokenId) external returns (bytes memory) {
                     bytes memory c = abi.encodeWithSelector(bytes4(keccak256("ownerOf(uint256)")), tokenId);
                     (, bytes memory res) = address(0xcB28749c24AF4797808364D71d71539bc01E76d4).staticcall(c);
                     return res;
@@ -138,5 +168,40 @@ mod test {
         )
         .await;
         println!("{:?}", res.unwrap().first().unwrap());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_execute_cheatcode() {
+        let solidity_code = r#"
+            pragma solidity ^0.8.0;
+
+            contract Test {
+                function test() external returns (uint) {
+                    return block.number;
+                }
+            }
+        "#;
+
+        sol! {
+            function test() external;
+        }
+
+        let result = compile::solidity::compile(solidity_code).unwrap();
+        let bytecode = result.first().unwrap().clone().bytecode;
+        let code = Bytes::from_hex(bytecode).expect("error getting bytes");
+        let calldata = testCall {}.abi_encode();
+        let res = execute_calldatas_fork(
+            code,
+            vec![Call {
+                caller: address!("881475210E75b814D5b711090a064942b6f30605"),
+                calldata: calldata.into(),
+                value: U256::ZERO,
+            }],
+        )
+        .await
+        .unwrap();
+        let result = res;
+        // assert!(!result.reverted);
+        println!("{:?}", result);
     }
 }
